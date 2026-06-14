@@ -1,0 +1,10 @@
+name: monolingual
+version: 0.1.0
+description: "Auto-detect language mixing in LLM output and rewrite into the user's language. Zero config — learns your language from your messages."
+author: GwynTel
+kind: standalone
+hooks:
+  - pre_llm_call
+  - transform_llm_output
+pip_dependencies:
+  - lingua-language-detector
