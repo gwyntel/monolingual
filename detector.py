@@ -357,16 +357,94 @@ def needs_translation(
     detected = detect_language(text_no_code, method=method)
 
     # Case 1: response is entirely in a different language
+    # But only trigger if there are actually foreign-script characters present.
+    # Lingua misclassifies very short Latin text (e.g. "Hello world" → vi),
+    # so we guard with a script check.
     if detected and detected != target_language:
-        return True, detected
+        foreign_count = _count_non_target_script_chars(text_no_code, target_language)
+        if foreign_count == 0:
+            # Same script as target, different language detected —
+            # likely short-text misclassification. Only trust if long.
+            if len(text_no_code) > 200:
+                return True, detected
+            # Short text, same script — skip. Fall through to mixing check.
+        else:
+            # Foreign-script chars present. For Latin targets (en, es, etc.),
+            # even 1 CJK char is suspicious. For non-Latin targets (zh, ja, etc.),
+            # require 3+ Latin words to avoid false-positives on tech terms.
+            latin_targets = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
+            if target_language in latin_targets or foreign_count >= 3:
+                return True, detected
 
     # Case 2: response looks like target language, but check for mixing
-    if detect_mixing and detected == target_language and method == "lingua":
-        is_mixing, ratio = _detect_lingua_mixing(text_no_code, target_language)
-        if is_mixing and ratio >= min_mix_ratio:
-            return True, detected  # mixed — translate the whole thing
+    if detect_mixing and detected == target_language:
+        # Try lingua's multi-language detection first (catches larger mixed spans)
+        if method == "lingua":
+            is_mixing, ratio = _detect_lingua_mixing(text_no_code, target_language)
+            if is_mixing and ratio >= min_mix_ratio:
+                return True, detected
+
+        # Fallback: unicode character scan. Lingua's per-word detection ignores
+        # single CJK characters embedded in Latin text — this catches them.
+        non_target_chars = _count_non_target_script_chars(text_no_code, target_language)
+        latin_targets = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
+        if target_language in latin_targets:
+            # For Latin targets, even 1 non-Latin char is suspicious
+            if non_target_chars > 0:
+                return True, detected
+        else:
+            # For non-Latin targets, require 3+ Latin words to avoid
+            # false-positives on technical terms like "Tailscale", "Proxmox"
+            if non_target_chars >= 3:
+                return True, detected
 
     return False, detected
+
+
+# Non-target script character ranges. Used to catch single CJK chars that
+# lingua's word-level mixing detector misses.
+_NON_LATIN_RANGES = re.compile(
+    "[" +
+    r"\u4e00-\u9fff"     # CJK Unified Ideographs
+    r"\u3400-\u4dbf"     # CJK Extension A
+    r"\U00020000-\U0002a6df"  # CJK Extension B (needs \U, not \u)
+    r"\u3040-\u309f"     # Hiragana
+    r"\u30a0-\u30ff"     # Katakana
+    r"\uac00-\ud7af"     # Hangul Syllables
+    r"\u0600-\u06ff"     # Arabic
+    r"\u0400-\u04ff"     # Cyrillic
+    r"\u0900-\u097f"     # Devanagari
+    r"\u0e00-\u0e7f"     # Thai
+    "]"
+)
+
+_LATIN_LETTER_RE = re.compile(r"[a-zA-Z]")
+
+
+def _count_non_target_script_chars(text: str, target_language: str) -> int:
+    """Count characters whose script doesn't belong to target_language.
+
+    For Latin-script targets (en, es, fr, de, etc.), counts CJK/Arabic/
+    Cyrillic/Devanagari/Thai characters — even single chars count.
+
+    For non-Latin targets (zh, ja, ko, ar, ru, hi, th), counts Latin
+    characters that appear outside of URLs, numbers, and common technical
+    terms. Returns the raw count so the caller can decide the threshold.
+
+    Returns 0 if no foreign-script characters found.
+    """
+    if not text:
+        return 0
+
+    latin_targets = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
+    if target_language in latin_targets:
+        # Count non-Latin script chars — even a single one is suspicious
+        return len(_NON_LATIN_RANGES.findall(text))
+    else:
+        # For non-Latin targets, count sequences of Latin letters that look
+        # like actual words (3+ consecutive letters, not just abbreviations).
+        latin_words = re.findall(r'[a-zA-Z]{3,}', text)
+        return len(latin_words)
 
 
 def _strip_code_blocks(text: str) -> str:
