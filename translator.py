@@ -13,7 +13,7 @@ Fallback chain:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Optional
 
 from .config import MonolingualConfig, get_config
 from .detector import language_name
@@ -21,17 +21,22 @@ from .detector import language_name
 logger = logging.getLogger("hermes.plugins.monolingual")
 
 TRANSLATION_SYSTEM_PROMPT = (
-    "You are a translation engine. Translate the following text to {target_lang_name}. "
+    "You are a precise translation engine. Translate the user's text from "
+    "{source_lang_name} to {target_lang_name}.\n\n"
     "Rules:\n"
-    "1. Preserve all technical terms that are standard in {target_lang_name} "
-    "(e.g. 'database', 'API', 'kernel' stay in English for English output).\n"
-    "2. Do NOT translate: code blocks, inline code, URLs, file paths, "
-    "command names, environment variables, package names.\n"
-    "3. Preserve the original tone and register — informal stays informal, "
-    "technical stays technical.\n"
-    "4. Preserve all formatting: markdown, bullet points, numbered lists, headers.\n"
-    "5. If a term has no standard {target_lang_name} equivalent, keep the original.\n"
-    "6. Output ONLY the translated text. No explanations, no notes, no preamble."
+    "1. Output ONLY the translated text. Do not add explanations, notes, "
+    "preambles, or markdown fences around the whole answer.\n"
+    "2. Preserve the original structure exactly: markdown headings, lists, "
+    "tables, blockquotes, blank lines, indentation, punctuation style, and emoji.\n"
+    "3. Do NOT translate code blocks, inline code, URLs, file paths, command "
+    "names, CLI flags, environment variables, package names, identifiers, logs, "
+    "or quoted data formats.\n"
+    "4. Preserve placeholders and templating syntax such as {{braces}}, "
+    "${{variables}}, %s, and {{{{ double_braces }}}}.\n"
+    "5. Preserve technical terms when they are normally used untranslated in "
+    "{target_lang_name}; otherwise use the standard {target_lang_name} term.\n"
+    "6. Keep the same tone and register; informal stays informal and technical "
+    "stays technical."
 )
 
 
@@ -42,7 +47,9 @@ def _build_messages(
 ) -> list:
     """Build the chat messages for a translation LLM call."""
     target_name = language_name(target_lang)
+    source_name = language_name(source_lang)
     system = TRANSLATION_SYSTEM_PROMPT.format(
+        source_lang_name=source_name,
         target_lang_name=target_name,
     )
     return [
@@ -66,20 +73,66 @@ def translate_via_ctx_llm(
     messages = _build_messages(text, source_lang, target_lang)
 
     try:
-        result = ctx.llm.complete(
+        llm = getattr(ctx, "llm", None)
+        if llm is None or not hasattr(llm, "complete"):
+            logger.debug("ctx.llm.complete is unavailable")
+            return None
+        result = llm.complete(
             messages=messages,
             temperature=0.1,  # low temp for faithful translation
             max_tokens=4096,
             timeout=config.translation_timeout,
             purpose="monolingual_translation",
         )
-        if result and result.text and result.text.strip():
-            return result.text.strip()
+        content = getattr(result, "text", None)
+        if isinstance(result, str):
+            content = result
+        if content and str(content).strip():
+            return str(content).strip()
         logger.warning("ctx.llm.complete returned empty result")
         return None
     except Exception as exc:
         logger.warning("ctx.llm translation failed: %s", exc)
         return None
+
+
+def _load_auxiliary_call_llm() -> Optional[Callable[..., Any]]:
+    """Return Hermes' internal auxiliary LLM helper if it is importable.
+
+    ``ctx.llm`` is the supported plugin API. This fallback is deliberately best
+    effort because Hermes' internal module path has changed across versions.
+    """
+    import_paths = (
+        "agent.auxiliary_client",
+        "hermes_cli.agent.auxiliary_client",
+    )
+    for module_name in import_paths:
+        try:
+            module = __import__(module_name, fromlist=["call_llm"])
+            call_llm = getattr(module, "call_llm", None)
+            if callable(call_llm):
+                return call_llm
+        except ImportError as exc:
+            logger.debug("auxiliary_client import failed for %s: %s", module_name, exc)
+        except Exception as exc:
+            logger.debug("auxiliary_client import error for %s: %s", module_name, exc)
+    return None
+
+
+def _extract_auxiliary_content(response: Any) -> Optional[str]:
+    """Extract message content from common OpenAI-like response shapes."""
+    if isinstance(response, str):
+        return response.strip() or None
+    try:
+        content = response.choices[0].message.content if response else None
+    except Exception:
+        content = None
+    if not content and isinstance(response, dict):
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except Exception:
+            content = None
+    return str(content).strip() if content and str(content).strip() else None
 
 
 def translate_via_auxiliary(
@@ -96,8 +149,11 @@ def translate_via_auxiliary(
     config = config or get_config()
     messages = _build_messages(text, source_lang, target_lang)
 
+    call_llm = _load_auxiliary_call_llm()
+    if call_llm is None:
+        return None
+
     try:
-        from agent.auxiliary_client import call_llm
         response = call_llm(
             task="title_generation",
             messages=messages,
@@ -105,10 +161,7 @@ def translate_via_auxiliary(
             max_tokens=4096,
             timeout=config.translation_timeout,
         )
-        content = response.choices[0].message.content if response else None
-        if content and content.strip():
-            return content.strip()
-        return None
+        return _extract_auxiliary_content(response)
     except Exception as exc:
         logger.debug("auxiliary_client translation fallback failed: %s", exc)
         return None
@@ -127,6 +180,13 @@ def translate(
     (fail-open — never block output).
     """
     config = config or get_config()
+
+    if config.max_translation_chars and len(text) > config.max_translation_chars:
+        logger.warning(
+            "Skipping translation for oversized text (%d chars > max_translation_chars=%d)",
+            len(text), config.max_translation_chars,
+        )
+        return text
 
     # Primary: ctx.llm (host's active model)
     result = translate_via_ctx_llm(ctx, text, source_lang, target_lang, config)
