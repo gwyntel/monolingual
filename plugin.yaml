@@ -6,5 +6,8 @@ kind: standalone
 hooks:
   - pre_llm_call
   - transform_llm_output
+  - on_session_end
 pip_dependencies:
   - lingua-language-detector
+requires_env: []
+provides_tools: []

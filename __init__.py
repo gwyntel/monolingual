@@ -7,6 +7,7 @@ learns the user's language from their own messages.
 Hooks:
   - pre_llm_call — samples user messages to detect preferred language
   - transform_llm_output — detects language issues and triggers translation
+  - on_session_end — clears in-memory session language profile
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import logging
 import threading
 from typing import Any, Dict, Optional
 
-from .config import MonolingualConfig, get_config
+from .config import get_config
 from .detector import (
     detect_user_language,
     language_name,
@@ -45,19 +46,27 @@ def _get_profile(session_id: str) -> Optional[str]:
         return _session_profiles.get(session_id)
 
 
+def _clear_profile(session_id: str) -> None:
+    with _profiles_lock:
+        _session_profiles.pop(session_id, None)
+
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
-def register(ctx) -> None:
+def register(ctx: Any) -> None:
     """Called by the Hermes plugin loader. Registers hooks."""
 
-    def on_pre_llm_call(**kwargs):
+    def on_pre_llm_call(**kwargs: Any) -> None:
         """Sample user messages to detect their preferred language.
 
         Stores the result in _session_profiles for use by transform_llm_output.
         """
         config = get_config()
+        if config.disabled:
+            return None
+
         conversation_history = kwargs.get("conversation_history", [])
         user_message = kwargs.get("user_message", "")
         session_id = kwargs.get("session_id", "")
@@ -65,14 +74,18 @@ def register(ctx) -> None:
         if not session_id:
             return None
 
-        lang = detect_user_language(
-            conversation_history=conversation_history,
-            user_message=user_message or "",
-            sample_window=config.sample_window,
-            min_sample_length=config.min_sample_length,
-            method=config.detector,
-            target_override=config.target_language,
-        )
+        try:
+            lang = detect_user_language(
+                conversation_history=conversation_history,
+                user_message=user_message or "",
+                sample_window=config.sample_window,
+                min_sample_length=config.min_sample_length,
+                method=config.detector,
+                target_override=config.target_language,
+            )
+        except Exception as exc:
+            logger.debug("monolingual: user language detection failed: %s", exc)
+            return None
 
         if lang:
             existing = _get_profile(session_id)
@@ -95,6 +108,10 @@ def register(ctx) -> None:
         response_text = kwargs.get("response_text", "")
         session_id = kwargs.get("session_id", "")
 
+        config = get_config()
+        if config.disabled:
+            return None
+
         if not response_text or not response_text.strip():
             return None
 
@@ -104,15 +121,26 @@ def register(ctx) -> None:
             # First turn or no user history — can't determine target, pass through
             return None
 
-        config = get_config()
-        should_translate, source_lang = needs_translation(
-            response_text=response_text,
-            target_language=target_lang,
-            method=config.detector,
-            min_mix_ratio=config.min_mix_ratio,
-        )
+        try:
+            should_translate, source_lang = needs_translation(
+                response_text=response_text,
+                target_language=target_lang,
+                method=config.detector,
+                min_mix_ratio=config.min_mix_ratio,
+            )
+        except Exception as exc:
+            logger.debug("monolingual: response language detection failed: %s", exc)
+            return None
 
         if not should_translate:
+            return None
+
+        if config.max_translation_chars and len(response_text) > config.max_translation_chars:
+            logger.warning(
+                "monolingual: skipping translation for oversized response "
+                "(%d chars > max_translation_chars=%d)",
+                len(response_text), config.max_translation_chars,
+            )
             return None
 
         source_display = language_name(source_lang) if source_lang else source_lang or "unknown"
@@ -124,13 +152,17 @@ def register(ctx) -> None:
         )
 
         # Translate
-        translated = translate(
-            ctx=ctx,
-            text=response_text,
-            source_lang=source_lang or "unknown",
-            target_lang=target_lang,
-            config=config,
-        )
+        try:
+            translated = translate(
+                ctx=ctx,
+                text=response_text,
+                source_lang=source_lang or "unknown",
+                target_lang=target_lang,
+                config=config,
+            )
+        except Exception as exc:
+            logger.debug("monolingual: translation failed open: %s", exc)
+            return None
 
         if translated == response_text:
             # Translation failed or returned identical text — no flag needed
@@ -143,8 +175,16 @@ def register(ctx) -> None:
         )
         return f"{flag}\n\n{translated}"
 
+    def on_session_end(**kwargs: Any) -> None:
+        """Drop in-memory language profile when a session ends."""
+        session_id = kwargs.get("session_id", "")
+        if session_id:
+            _clear_profile(session_id)
+        return None
+
     # Register both hooks
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("transform_llm_output", on_transform_llm_output)
+    ctx.register_hook("on_session_end", on_session_end)
 
     logger.info("monolingual plugin registered (language detection from user messages)")
