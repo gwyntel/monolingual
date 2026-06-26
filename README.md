@@ -38,7 +38,7 @@ That's it. No configuration required.
 
 ### Language Detection
 
-On every LLM call, the `pre_llm_call` hook samples your recent messages and runs language detection using [lingua](https://github.com/pemistahl/lingua-py) — the most accurate Python language detection library, with explicit support for mixed-language text.
+On every LLM call, the `pre_llm_call` hook samples your recent messages and runs language detection using [lingua](https://github.com/pemistahl/lingua-py) — the most accurate Python language detection library, with explicit support for mixed-language text. Detection results are cached in memory to avoid re-processing repeated messages.
 
 The detected language is stored per-session in memory. It adapts as you switch languages — it's a rolling window, not a fixed setting.
 
@@ -50,6 +50,8 @@ On every LLM response, the `transform_llm_output` hook checks:
 2. **Secondary check:** Does the response mix your language with another language? (Only if `detect_mixing` is on.)
 
 If either check triggers, the plugin calls the host's `ctx.llm.complete()` to translate the response, then replaces the original text with the translation.
+
+Very large responses are skipped by default (`max_translation_chars: 20000`) so an accidental huge dump does not trigger an expensive translation call.
 
 ### Translation Execution
 
@@ -79,6 +81,9 @@ plugins:
     - monolingual
   entries:
     monolingual:
+      # Soft-disable the plugin without removing it from plugins.enabled
+      disabled: false                  # default: false
+
       # Override auto-detection: force a specific target language
       # If empty (default), the plugin learns from your messages
       target_language: ""              # e.g. "en", "zh", "ja", "ko", "es"
@@ -100,13 +105,21 @@ plugins:
 
       # Timeout in seconds for the translation LLM call
       translation_timeout: 30         # default: 30
+
+      # Do not translate responses larger than this many characters
+      # Set to 0 to disable the size guard
+      max_translation_chars: 20000     # default: 20000
+
+      # How often to refresh config from disk while Hermes is running
+      # Set to 0 to keep the first loaded config until process restart
+      config_reload_seconds: 5         # default: 5
 ```
 
 ## Detection Methods
 
 ### lingua (default)
 
-[lingua-language-detector](https://pypi.org/project/lingua-language-detector/) — Rust-backed, highly accurate, supports mixed-language detection across 75 languages. This is the recommended method.
+[lingua-language-detector](https://pypi.org/project/lingua-language-detector/) — Rust-backed, highly accurate, supports mixed-language detection across 75 languages. This is the recommended method. Monolingual narrows Lingua to the plugin's supported common languages for better short-text accuracy, preloads language models for repeated plugin use, and falls back to Unicode script heuristics when confidence is low.
 
 Install: `pip install lingua-language-detector`
 
@@ -117,9 +130,10 @@ A zero-dependency heuristic that checks Unicode codepoint ranges for CJK, Arabic
 ## Design Decisions
 
 - **Fail-open:** Any error in detection or translation → original text passes through. Never blocks output.
-- **Session-scoped profiles:** Language detection is per-session, rebuilt from conversation history each turn. No persistent state needed.
+- **Session-scoped profiles:** Language detection is per-session, rebuilt from conversation history each turn, and cleared on `on_session_end`. No persistent state needed.
 - **`transform_llm_output` hook:** The right Hermes hook for this job — returns a replacement string. `post_llm_call` is observer-only.
 - **`ctx.llm` for translation:** Uses the host's PluginLlm facade — supported, no internal API imports needed.
+- **Best-effort fallback:** If available, an auxiliary LLM client may be used after `ctx.llm`; otherwise output passes through unchanged.
 - **Translate entire response, not spans:** Simpler, preserves coherence. Span-by-span translation would create jarring switches.
 - **First turn is a free pass:** No user history → no detection → no translation. Kicks in from the second turn onward.
 
@@ -132,6 +146,7 @@ monolingual/
 ├── config.py            # Config reader (all optional)
 ├── detector.py          # Language detection + mixing detection
 ├── translator.py        # LLM-based rewrite with fallback chain
+├── tests/               # pytest coverage for detection/config/translation
 └── README.md            # This file
 ```
 
