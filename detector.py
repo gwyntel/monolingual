@@ -14,7 +14,8 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("hermes.plugins.monolingual")
 
@@ -45,6 +46,12 @@ LANGUAGE_NAMES: Dict[str, str] = {
     "sv": "Swedish",
 }
 
+LATIN_TARGET_LANGUAGES = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
+
+# Lingua confidence below this point is often ambiguous on short technical text.
+# We use unicode script heuristics as a tiebreaker instead of blindly trusting it.
+LINGUA_CONFIDENCE_THRESHOLD = 0.65
+
 
 def language_name(code: str) -> str:
     """Return human-readable name for an ISO 639-1 code."""
@@ -68,6 +75,17 @@ def _normalize_lang(code: str) -> str:
     return mappings.get(code, code)
 
 
+def _lang_from_lingua(language: Any) -> Optional[str]:
+    """Return an ISO 639-1 code from a lingua Language object."""
+    try:
+        iso = language.iso_code_639_1
+        if iso is None:
+            return None
+        return _normalize_lang(iso.name)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Unicode-range heuristic (zero-dependency fallback)
 # ---------------------------------------------------------------------------
@@ -79,9 +97,7 @@ def _cjk_ratio(text: str) -> float:
     cjk_count = 0
     for ch in text:
         cp = ord(ch)
-        if (0x4E00 <= cp <= 0x9FFF or   # CJK Unified Ideographs
-            0x3400 <= cp <= 0x4DBF or   # CJK Extension A
-            0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
+        if (_is_cjk_unified(cp) or       # CJK Unified Ideographs + extensions
             0x3040 <= cp <= 0x309F or   # Hiragana
             0x30A0 <= cp <= 0x30FF or   # Katakana
             0xAC00 <= cp <= 0xD7AF or   # Hangul Syllables
@@ -93,12 +109,26 @@ def _cjk_ratio(text: str) -> float:
     return cjk_count / len(text)
 
 
+def _is_cjk_unified(cp: int) -> bool:
+    """Return True for CJK unified ideograph blocks, including supplements."""
+    return (
+        0x4E00 <= cp <= 0x9FFF or     # CJK Unified Ideographs
+        0x3400 <= cp <= 0x4DBF or     # Extension A
+        0x20000 <= cp <= 0x2A6DF or   # Extension B
+        0x2A700 <= cp <= 0x2B73F or   # Extension C
+        0x2B740 <= cp <= 0x2B81F or   # Extension D
+        0x2B820 <= cp <= 0x2CEAF or   # Extension E/F
+        0x2CEB0 <= cp <= 0x2EBEF or   # Extension F/G/I area
+        0x30000 <= cp <= 0x3134F      # Extension G/H
+    )
+
+
 def _detect_unicode(text: str) -> Optional[str]:
     """Crude unicode-range heuristic. Returns ISO 639-1 or None."""
     if not text:
         return None
     # Script counters
-    zh_count = sum(1 for ch in text if 0x4E00 <= ord(ch) <= 0x9FFF or 0x3400 <= ord(ch) <= 0x4DBF or 0x20000 <= ord(ch) <= 0x2A6DF)
+    zh_count = sum(1 for ch in text if _is_cjk_unified(ord(ch)))
     ja_hira = sum(1 for ch in text if 0x3040 <= ord(ch) <= 0x309F)
     ja_kata = sum(1 for ch in text if 0x30A0 <= ord(ch) <= 0x30FF)
     ko_count = sum(1 for ch in text if 0xAC00 <= ord(ch) <= 0xD7AF)
@@ -132,8 +162,10 @@ _lingua_detector = None
 def _get_lingua_detector():
     """Lazy-init lingua detector.
 
-    Uses a scoped set of common languages instead of all 75 — much more
-    accurate on short/technical text that would otherwise confuse the detector.
+    Uses a scoped set of languages supported by this plugin's script heuristics.
+    Lingua recommends narrowing candidates when the expected language set is
+    known; this improves accuracy on short/technical text. Models are preloaded
+    because hooks call detection repeatedly during a Hermes session.
     """
     global _lingua_detector
     if _lingua_detector is not None:
@@ -164,7 +196,7 @@ def _get_lingua_detector():
                 Language.SWEDISH,
                 Language.INDONESIAN,
             )
-            .with_low_accuracy_mode()
+            .with_preloaded_language_models()
             .build()
         )
         return _lingua_detector
@@ -175,10 +207,11 @@ def _get_lingua_detector():
         return None
 
 
+@lru_cache(maxsize=1024)
 def _detect_lingua(text: str) -> Optional[str]:
     """Detect language using lingua with confidence-weighted result.
 
-    If the top result has low confidence (< 0.5), falls back to unicode heuristic.
+    If the top result has low confidence, falls back to unicode heuristic.
     """
     detector = _get_lingua_detector()
     if detector is None:
@@ -188,11 +221,13 @@ def _detect_lingua(text: str) -> Optional[str]:
         if not confidence_values:
             return None
         top = confidence_values[0]
-        top_lang = top.language.iso_code_639_1.name.lower()
+        top_lang = _lang_from_lingua(top.language)
+        if not top_lang:
+            return _detect_unicode(text)
         top_conf = top.value
 
         # If lingua is very confident, trust it
-        if top_conf >= 0.5:
+        if top_conf >= LINGUA_CONFIDENCE_THRESHOLD:
             return top_lang
 
         # Low confidence — if top candidate is a "close" language (de/nl for en),
@@ -225,7 +260,7 @@ def _detect_lingua_mixing(text: str, target: str) -> Tuple[bool, float]:
         for span in results:
             span_text = " ".join(w.word if hasattr(w, 'word') else str(w) for w in (span.words or []))
             span_len = max(len(span_text), 1)
-            lang_code = span.language.iso_code_639_1.name.lower() if hasattr(span.language, 'iso_code_639_1') else None
+            lang_code = _lang_from_lingua(span.language)
             total_chars += span_len
             if lang_code and lang_code != target:
                 non_target_chars += span_len
@@ -240,6 +275,7 @@ def _detect_lingua_mixing(text: str, target: str) -> Tuple[bool, float]:
 # Unified detection API
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=2048)
 def detect_language(text: str, method: str = "lingua") -> Optional[str]:
     """Detect the dominant language of text.
 
@@ -250,7 +286,8 @@ def detect_language(text: str, method: str = "lingua") -> Optional[str]:
     Returns:
         ISO 639-1 code (e.g. "en", "zh") or None if detection fails.
     """
-    if method == "unicode":
+    normalized_method = (method or "lingua").lower()
+    if normalized_method == "unicode":
         return _detect_unicode(text)
     # Try lingua first, fall back to unicode
     result = _detect_lingua(text)
@@ -372,14 +409,13 @@ def needs_translation(
             # Foreign-script chars present. For Latin targets (en, es, etc.),
             # even 1 CJK char is suspicious. For non-Latin targets (zh, ja, etc.),
             # require 3+ Latin words to avoid false-positives on tech terms.
-            latin_targets = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
-            if target_language in latin_targets or foreign_count >= 3:
+            if target_language in LATIN_TARGET_LANGUAGES or foreign_count >= 3:
                 return True, detected
 
     # Case 2: response looks like target language, but check for mixing
     if detect_mixing and detected == target_language:
         # Try lingua's multi-language detection first (catches larger mixed spans)
-        if method == "lingua":
+        if (method or "lingua").lower() == "lingua":
             is_mixing, ratio = _detect_lingua_mixing(text_no_code, target_language)
             if is_mixing and ratio >= min_mix_ratio:
                 return True, detected
@@ -387,8 +423,7 @@ def needs_translation(
         # Fallback: unicode character scan. Lingua's per-word detection ignores
         # single CJK characters embedded in Latin text — this catches them.
         non_target_chars = _count_non_target_script_chars(text_no_code, target_language)
-        latin_targets = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
-        if target_language in latin_targets:
+        if target_language in LATIN_TARGET_LANGUAGES:
             # For Latin targets, even 1 non-Latin char is suspicious
             if non_target_chars > 0:
                 return True, detected
@@ -408,6 +443,11 @@ _NON_LATIN_RANGES = re.compile(
     r"\u4e00-\u9fff"     # CJK Unified Ideographs
     r"\u3400-\u4dbf"     # CJK Extension A
     r"\U00020000-\U0002a6df"  # CJK Extension B (needs \U, not \u)
+    r"\U0002a700-\U0002b73f"  # CJK Extension C
+    r"\U0002b740-\U0002b81f"  # CJK Extension D
+    r"\U0002b820-\U0002ceaf"  # CJK Extension E/F
+    r"\U0002ceb0-\U0002ebef"  # CJK Extension F/G/I area
+    r"\U00030000-\U0003134f"  # CJK Extension G/H
     r"\u3040-\u309f"     # Hiragana
     r"\u30a0-\u30ff"     # Katakana
     r"\uac00-\ud7af"     # Hangul Syllables
@@ -417,9 +457,6 @@ _NON_LATIN_RANGES = re.compile(
     r"\u0e00-\u0e7f"     # Thai
     "]"
 )
-
-_LATIN_LETTER_RE = re.compile(r"[a-zA-Z]")
-
 
 def _count_non_target_script_chars(text: str, target_language: str) -> int:
     """Count characters whose script doesn't belong to target_language.
@@ -436,21 +473,23 @@ def _count_non_target_script_chars(text: str, target_language: str) -> int:
     if not text:
         return 0
 
-    latin_targets = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
-    if target_language in latin_targets:
+    if target_language in LATIN_TARGET_LANGUAGES:
         # Count non-Latin script chars — even a single one is suspicious
         return len(_NON_LATIN_RANGES.findall(text))
     else:
         # For non-Latin targets, count sequences of Latin letters that look
         # like actual words (3+ consecutive letters, not just abbreviations).
-        latin_words = re.findall(r'[a-zA-Z]{3,}', text)
+        cleaned = re.sub(r"https?://\S+|www\.\S+|\b[\w.-]+@[\w.-]+\b", " ", text)
+        cleaned = re.sub(r"\b[A-Za-z]:[\\/][^\s]+|(?:[./~]|/)[^\s]+", " ", cleaned)
+        cleaned = re.sub(r"\b[A-Z_][A-Z0-9_]{2,}\b", " ", cleaned)
+        latin_words = re.findall(r'[A-Za-z]{3,}', cleaned)
         return len(latin_words)
 
 
 def _strip_code_blocks(text: str) -> str:
     """Remove fenced code blocks (```...```) and inline code from text."""
-    # Remove fenced blocks
-    text = re.sub(r'```[\s\S]*?```', '', text)
-    # Remove inline code
-    text = re.sub(r'`[^`]+`', '', text)
+    # Remove fenced Markdown blocks with backticks or tildes.
+    text = re.sub(r'(?ms)^\s*(```|~~~).*?^\s*\1\s*$', '', text)
+    # Remove inline code spans, including multi-backtick spans.
+    text = re.sub(r'`+[^`]+`+', '', text)
     return text.strip()
