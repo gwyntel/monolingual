@@ -247,6 +247,10 @@ def _detect_lingua_mixing(text: str, target: str) -> Tuple[bool, float]:
     """Check if text contains significant non-target language mixing.
 
     Returns (is_mixing, non_target_ratio).
+
+    Note: lingua's ``DetectionResult`` exposes character offsets
+    (``start_index``/``end_index``), not word lists — span length is measured
+    in characters so multi-sentence minority spans are weighed correctly.
     """
     detector = _get_lingua_detector()
     if detector is None:
@@ -258,8 +262,7 @@ def _detect_lingua_mixing(text: str, target: str) -> Tuple[bool, float]:
         total_chars = 0
         non_target_chars = 0
         for span in results:
-            span_text = " ".join(w.word if hasattr(w, 'word') else str(w) for w in (span.words or []))
-            span_len = max(len(span_text), 1)
+            span_len = max(span.end_index - span.start_index, 1)
             lang_code = _lang_from_lingua(span.language)
             total_chars += span_len
             if lang_code and lang_code != target:
@@ -309,8 +312,8 @@ def detect_user_language(
 
     Samples the last N user-role messages from conversation_history, plus the
     current user_message. Runs language detection on each, accumulates
-    confidence-weighted scores, and returns the language with the highest
-    total confidence score.
+    length-weighted scores (longer messages count more), and returns the
+    language with the highest total score.
 
     Args:
         conversation_history: List of message dicts with 'role' and 'content'.
