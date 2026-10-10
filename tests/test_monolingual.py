@@ -245,3 +245,28 @@ def test_lingua_mixing_detection_uses_char_spans() -> None:
     # returned (False, 0.0), so the lingua mixing branch could never fire.
     assert is_mixing is True
     assert ratio > 0.05
+
+
+def test_detect_mixing_false_skips_mixed_text_with_two_cjk_chars() -> None:
+    # Greptile P1 regression: with detect_mixing=False, an English response
+    # containing exactly two CJK chars ("中文") must NOT be translated. The
+    # unicode detector classifies the whole text as zh, but the target script
+    # dominates, so this is mixing — not a wrong-language response.
+    response = "This is an English response containing 中文 characters."
+    should_off, detected = detector.needs_translation(
+        response, "en", method="unicode", detect_mixing=False)
+    assert should_off is False
+    assert detected == "zh"
+    should_on, _ = detector.needs_translation(
+        response, "en", method="unicode", detect_mixing=True)
+    assert should_on is True
+
+
+def test_fully_wrong_language_still_translates_with_detect_mixing_false() -> None:
+    # A genuinely Chinese response to an English user is *not* mixing —
+    # it must still be translated even when detect_mixing is off.
+    response = "这是一段中文回复，需要翻译成英文。"
+    should_translate, detected = detector.needs_translation(
+        response, "en", method="unicode", detect_mixing=False)
+    assert should_translate is True
+    assert detected == "zh"
