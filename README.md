@@ -24,7 +24,7 @@ Monolingual is a Hermes Agent plugin that:
 pip install lingua-language-detector
 
 # Clone the plugin into Hermes plugins directory
-git clone https://github.com/GwynTel/monolingual.git ~/.hermes/plugins/monolingual
+git clone https://github.com/gwyntel/monolingual.git ~/.hermes/plugins/monolingual
 
 # Enable the plugin
 hermes plugins enable monolingual
@@ -96,6 +96,10 @@ plugins:
 
       # Fraction of non-target text to trigger mixing translation
       min_mix_ratio: 0.15             # default: 0.15
+
+      # Also translate responses that mix your language with another one.
+      # Disable if you only want full wrong-language responses rewritten.
+      detect_mixing: true             # default: true
 
       # Detection method: "lingua" (accurate) or "unicode" (fast, zero-dep)
       detector: "lingua"              # default: "lingua"

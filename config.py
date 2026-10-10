@@ -19,6 +19,7 @@ DEFAULT_MIN_SAMPLE_LENGTH = 20
 DEFAULT_MIN_MIX_RATIO = 0.15
 DEFAULT_FLAG_TEMPLATE = "[translated from {source} by GwynTel/monolingual]"
 DEFAULT_DETECTOR = "lingua"
+DEFAULT_DETECT_MIXING = True
 DEFAULT_TRANSLATION_TIMEOUT = 30
 DEFAULT_MAX_TRANSLATION_CHARS = 20_000
 DEFAULT_CONFIG_RELOAD_SECONDS = 5.0
@@ -65,6 +66,7 @@ class MonolingualConfig:
         self.flag_template: str = str(raw.get("flag_template") or DEFAULT_FLAG_TEMPLATE)
         detector = str(raw.get("detector") or DEFAULT_DETECTOR).strip().lower()
         self.detector: str = detector if detector in {"lingua", "unicode"} else DEFAULT_DETECTOR
+        self.detect_mixing: bool = _as_bool(raw.get("detect_mixing"), DEFAULT_DETECT_MIXING)
         self.translation_timeout: int = _as_int(raw.get("translation_timeout"), DEFAULT_TRANSLATION_TIMEOUT, minimum=1)
         self.max_translation_chars: int = _as_int(
             raw.get("max_translation_chars"),

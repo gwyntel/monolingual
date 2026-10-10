@@ -211,3 +211,62 @@ def test_plugin_disabled_config(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin.register(ctx)
     assert ctx.hooks["pre_llm_call"](session_id="s1", user_message="English message long enough") is None
     assert plugin._get_profile("s1") is None
+
+def test_detect_mixing_config_option() -> None:
+    assert config_mod.MonolingualConfig({}).detect_mixing is True
+    assert config_mod.MonolingualConfig({"detect_mixing": False}).detect_mixing is False
+    assert config_mod.MonolingualConfig({"detect_mixing": "no"}).detect_mixing is False
+    assert config_mod.MonolingualConfig({"detect_mixing": "yes"}).detect_mixing is True
+
+
+def test_needs_translation_respects_detect_mixing_flag() -> None:
+    # Single CJK char in English text: whole-text detection says "en",
+    # so only the mixing check can trigger translation.
+    response = "This is English with 一 Chinese character."
+    should_on, _ = detector.needs_translation(response, "en", method="unicode", detect_mixing=True)
+    should_off, _ = detector.needs_translation(response, "en", method="unicode", detect_mixing=False)
+    assert should_on is True
+    assert should_off is False
+
+
+def test_lingua_mixing_detection_uses_char_spans() -> None:
+    pytest.importorskip("lingua")
+    ling = detector._get_lingua_detector()
+    assert ling is not None
+    en = "The quarterly report shows strong growth across all major product lines. " * 14
+    zh = "本季度报告显示所有主要产品线均实现了强劲增长。" * 14
+    text = en + zh
+    spans = ling.detect_multiple_languages_of(text)
+    langs = {detector._lang_from_lingua(s.language) for s in spans}
+    if len(langs) < 2:
+        pytest.skip("lingua did not return multiple language spans for mixed text")
+    is_mixing, ratio = detector._detect_lingua_mixing(text, "en")
+    # Regression: the old code read span.words (AttributeError) and always
+    # returned (False, 0.0), so the lingua mixing branch could never fire.
+    assert is_mixing is True
+    assert ratio > 0.05
+
+
+def test_detect_mixing_false_skips_mixed_text_with_two_cjk_chars() -> None:
+    # Greptile P1 regression: with detect_mixing=False, an English response
+    # containing exactly two CJK chars ("中文") must NOT be translated. The
+    # unicode detector classifies the whole text as zh, but the target script
+    # dominates, so this is mixing — not a wrong-language response.
+    response = "This is an English response containing 中文 characters."
+    should_off, detected = detector.needs_translation(
+        response, "en", method="unicode", detect_mixing=False)
+    assert should_off is False
+    assert detected == "zh"
+    should_on, _ = detector.needs_translation(
+        response, "en", method="unicode", detect_mixing=True)
+    assert should_on is True
+
+
+def test_fully_wrong_language_still_translates_with_detect_mixing_false() -> None:
+    # A genuinely Chinese response to an English user is *not* mixing —
+    # it must still be translated even when detect_mixing is off.
+    response = "这是一段中文回复，需要翻译成英文。"
+    should_translate, detected = detector.needs_translation(
+        response, "en", method="unicode", detect_mixing=False)
+    assert should_translate is True
+    assert detected == "zh"

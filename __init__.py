@@ -127,6 +127,7 @@ def register(ctx: Any) -> None:
                 target_language=target_lang,
                 method=config.detector,
                 min_mix_ratio=config.min_mix_ratio,
+                detect_mixing=config.detect_mixing,
             )
         except Exception as exc:
             logger.debug("monolingual: response language detection failed: %s", exc)
