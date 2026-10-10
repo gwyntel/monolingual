@@ -211,3 +211,37 @@ def test_plugin_disabled_config(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin.register(ctx)
     assert ctx.hooks["pre_llm_call"](session_id="s1", user_message="English message long enough") is None
     assert plugin._get_profile("s1") is None
+
+def test_detect_mixing_config_option() -> None:
+    assert config_mod.MonolingualConfig({}).detect_mixing is True
+    assert config_mod.MonolingualConfig({"detect_mixing": False}).detect_mixing is False
+    assert config_mod.MonolingualConfig({"detect_mixing": "no"}).detect_mixing is False
+    assert config_mod.MonolingualConfig({"detect_mixing": "yes"}).detect_mixing is True
+
+
+def test_needs_translation_respects_detect_mixing_flag() -> None:
+    # Single CJK char in English text: whole-text detection says "en",
+    # so only the mixing check can trigger translation.
+    response = "This is English with 一 Chinese character."
+    should_on, _ = detector.needs_translation(response, "en", method="unicode", detect_mixing=True)
+    should_off, _ = detector.needs_translation(response, "en", method="unicode", detect_mixing=False)
+    assert should_on is True
+    assert should_off is False
+
+
+def test_lingua_mixing_detection_uses_char_spans() -> None:
+    pytest.importorskip("lingua")
+    ling = detector._get_lingua_detector()
+    assert ling is not None
+    en = "The quarterly report shows strong growth across all major product lines. " * 14
+    zh = "本季度报告显示所有主要产品线均实现了强劲增长。" * 14
+    text = en + zh
+    spans = ling.detect_multiple_languages_of(text)
+    langs = {detector._lang_from_lingua(s.language) for s in spans}
+    if len(langs) < 2:
+        pytest.skip("lingua did not return multiple language spans for mixed text")
+    is_mixing, ratio = detector._detect_lingua_mixing(text, "en")
+    # Regression: the old code read span.words (AttributeError) and always
+    # returned (False, 0.0), so the lingua mixing branch could never fire.
+    assert is_mixing is True
+    assert ratio > 0.05
