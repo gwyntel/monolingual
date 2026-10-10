@@ -367,6 +367,24 @@ def detect_user_language(
     return best_lang
 
 
+def _is_mixed_text(text: str, target_language: str) -> bool:
+    """Return True if the target script still dominates the text.
+
+    Distinguishes genuinely wrong-language responses from mixed text: a few
+    foreign-script characters can flip whole-text detection (e.g. the unicode
+    heuristic reports "zh" for English text containing just two CJK chars),
+    but the response is still mostly the user's language. Mixed text should
+    honor ``detect_mixing`` instead of translating unconditionally.
+    """
+    if not text:
+        return False
+    if target_language in LATIN_TARGET_LANGUAGES:
+        foreign_chars = len(_NON_LATIN_RANGES.findall(text))
+    else:
+        foreign_chars = len(re.findall(r"[A-Za-z]", text))
+    return (foreign_chars / len(text)) < 0.5
+
+
 def needs_translation(
     response_text: str,
     target_language: str,
@@ -408,10 +426,17 @@ def needs_translation(
             if len(text_no_code) > 200:
                 return True, detected
             # Short text, same script — skip. Fall through to mixing check.
+        elif _is_mixed_text(text_no_code, target_language):
+            # The target script still dominates: this is language *mixing*,
+            # not a fully wrong-language response — honor detect_mixing.
+            if detect_mixing:
+                return True, detected
+            return False, detected
         else:
-            # Foreign-script chars present. For Latin targets (en, es, etc.),
-            # even 1 CJK char is suspicious. For non-Latin targets (zh, ja, etc.),
-            # require 3+ Latin words to avoid false-positives on tech terms.
+            # Fully (or mostly) wrong-language response. For Latin targets
+            # (en, es, etc.), foreign-script chars are present. For non-Latin
+            # targets (zh, ja, etc.), require 3+ Latin words to avoid
+            # false-positives on tech terms.
             if target_language in LATIN_TARGET_LANGUAGES or foreign_count >= 3:
                 return True, detected
 
