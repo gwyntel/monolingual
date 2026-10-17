@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/gwyntel/monolingual)
+
 # GwynTel/Monolingual
 
 **Auto-detect language mixing in LLM output and rewrite into the user's language.**
