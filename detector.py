@@ -247,6 +247,10 @@ def _detect_lingua_mixing(text: str, target: str) -> Tuple[bool, float]:
     """Check if text contains significant non-target language mixing.
 
     Returns (is_mixing, non_target_ratio).
+
+    Note: lingua's ``DetectionResult`` exposes character offsets
+    (``start_index``/``end_index``), not word lists — span length is measured
+    in characters so multi-sentence minority spans are weighed correctly.
     """
     detector = _get_lingua_detector()
     if detector is None:
@@ -258,8 +262,7 @@ def _detect_lingua_mixing(text: str, target: str) -> Tuple[bool, float]:
         total_chars = 0
         non_target_chars = 0
         for span in results:
-            span_text = " ".join(w.word if hasattr(w, 'word') else str(w) for w in (span.words or []))
-            span_len = max(len(span_text), 1)
+            span_len = max(span.end_index - span.start_index, 1)
             lang_code = _lang_from_lingua(span.language)
             total_chars += span_len
             if lang_code and lang_code != target:
@@ -309,8 +312,8 @@ def detect_user_language(
 
     Samples the last N user-role messages from conversation_history, plus the
     current user_message. Runs language detection on each, accumulates
-    confidence-weighted scores, and returns the language with the highest
-    total confidence score.
+    length-weighted scores (longer messages count more), and returns the
+    language with the highest total score.
 
     Args:
         conversation_history: List of message dicts with 'role' and 'content'.
@@ -364,6 +367,24 @@ def detect_user_language(
     return best_lang
 
 
+def _is_mixed_text(text: str, target_language: str) -> bool:
+    """Return True if the target script still dominates the text.
+
+    Distinguishes genuinely wrong-language responses from mixed text: a few
+    foreign-script characters can flip whole-text detection (e.g. the unicode
+    heuristic reports "zh" for English text containing just two CJK chars),
+    but the response is still mostly the user's language. Mixed text should
+    honor ``detect_mixing`` instead of translating unconditionally.
+    """
+    if not text:
+        return False
+    if target_language in LATIN_TARGET_LANGUAGES:
+        foreign_chars = len(_NON_LATIN_RANGES.findall(text))
+    else:
+        foreign_chars = len(re.findall(r"[A-Za-z]", text))
+    return (foreign_chars / len(text)) < 0.5
+
+
 def needs_translation(
     response_text: str,
     target_language: str,
@@ -405,10 +426,17 @@ def needs_translation(
             if len(text_no_code) > 200:
                 return True, detected
             # Short text, same script — skip. Fall through to mixing check.
+        elif _is_mixed_text(text_no_code, target_language):
+            # The target script still dominates: this is language *mixing*,
+            # not a fully wrong-language response — honor detect_mixing.
+            if detect_mixing:
+                return True, detected
+            return False, detected
         else:
-            # Foreign-script chars present. For Latin targets (en, es, etc.),
-            # even 1 CJK char is suspicious. For non-Latin targets (zh, ja, etc.),
-            # require 3+ Latin words to avoid false-positives on tech terms.
+            # Fully (or mostly) wrong-language response. For Latin targets
+            # (en, es, etc.), foreign-script chars are present. For non-Latin
+            # targets (zh, ja, etc.), require 3+ Latin words to avoid
+            # false-positives on tech terms.
             if target_language in LATIN_TARGET_LANGUAGES or foreign_count >= 3:
                 return True, detected
 
