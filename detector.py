@@ -375,13 +375,30 @@ def _is_mixed_text(text: str, target_language: str) -> bool:
     heuristic reports "zh" for English text containing just two CJK chars),
     but the response is still mostly the user's language. Mixed text should
     honor ``detect_mixing`` instead of translating unconditionally.
+
+    For a non-Latin target the test is "is the target script present and
+    dominant", never "are ASCII letters a minority". Counting only Latin
+    characters made a Chinese or Arabic reply that happens to contain product
+    names ("OpenAI", "ChatGPT", "Proxmox") look like mixing in a Russian
+    conversation: the target script was absent entirely, yet the ASCII share
+    was below half, so ``detect_mixing=False`` skipped the translation the user
+    needed. Absent target script is a wrong-language response, not mixing.
     """
     if not text:
         return False
     if target_language in LATIN_TARGET_LANGUAGES:
         foreign_chars = len(_NON_LATIN_RANGES.findall(text))
-    else:
-        foreign_chars = len(re.findall(r"[A-Za-z]", text))
+        return (foreign_chars / len(text)) < 0.5
+    target_range = _TARGET_SCRIPT_RANGES.get(target_language)
+    if target_range is not None:
+        target_chars = len(target_range.findall(text))
+        if target_chars == 0:
+            # No target-script character at all: not mixing, just wrong language.
+            return False
+        return (target_chars / len(text)) >= 0.5
+    # Unknown non-Latin target: no script range to compare against, so fall back
+    # to the ASCII-minority heuristic.
+    foreign_chars = len(re.findall(r"[A-Za-z]", text))
     return (foreign_chars / len(text)) < 0.5
 
 
@@ -485,6 +502,43 @@ _NON_LATIN_RANGES = re.compile(
     r"\u0e00-\u0e7f"     # Thai
     "]"
 )
+
+# Script range for the target itself, used to decide whether a non-Latin reply is
+# "mixed" (target script present and dominant) or simply the wrong language.
+# Languages without an entry fall back to the ASCII-minority heuristic.
+_TARGET_SCRIPT_RANGES = {
+    "zh": re.compile(
+        "["
+        r"\u4e00-\u9fff"          # CJK Unified Ideographs
+        r"\u3400-\u4dbf"          # CJK Extension A
+        r"\U00020000-\U0002a6df"  # CJK Extension B
+        r"\U0002a700-\U0002b73f"  # CJK Extension C
+        r"\U0002b740-\U0002b81f"  # CJK Extension D
+        r"\U0002b820-\U0002ceaf"  # CJK Extension E/F
+        r"\U0002ceb0-\U0002ebef"  # CJK Extension F/G/I area
+        r"\U00030000-\U0003134f"  # CJK Extension G/H
+        "]"
+    ),
+    "ja": re.compile(
+        "["
+        r"\u4e00-\u9fff"          # Kanji
+        r"\u3040-\u309f"          # Hiragana
+        r"\u30a0-\u30ff"          # Katakana
+        r"\uff66-\uff9d"          # Halfwidth Katakana
+        "]"
+    ),
+    "ko": re.compile(
+        "["
+        r"\uac00-\ud7af"          # Hangul Syllables
+        r"\u1100-\u11ff"          # Hangul Jamo
+        r"\u3130-\u318f"          # Hangul Compatibility Jamo
+        "]"
+    ),
+    "ru": re.compile(r"[\u0400-\u04ff]"),   # Cyrillic
+    "ar": re.compile(r"[\u0600-\u06ff\u0750-\u077f]"),  # Arabic
+    "hi": re.compile(r"[\u0900-\u097f]"),   # Devanagari
+    "th": re.compile(r"[\u0e00-\u0e7f]"),   # Thai
+}
 
 def _count_non_target_script_chars(text: str, target_language: str) -> int:
     """Count characters whose script doesn't belong to target_language.

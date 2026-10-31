@@ -270,3 +270,42 @@ def test_fully_wrong_language_still_translates_with_detect_mixing_false() -> Non
         response, "en", method="unicode", detect_mixing=False)
     assert should_translate is True
     assert detected == "zh"
+
+
+def test_non_latin_target_translates_foreign_reply_carrying_latin_terms() -> None:
+    # Greptile P1 regression: a Chinese reply to a *Russian* user must be
+    # translated even with detect_mixing=False. The old heuristic counted only
+    # ASCII letters, so a CJK-dominant reply whose product names push the ASCII
+    # share under half was called "mixed" — skipping the translation entirely
+    # even though not one Cyrillic character was present in the text.
+    response = (
+        "这是一段很长的中文说明文字，介绍了 OpenAI 和 ChatGPT 以及 Proxmox "
+        "这几个工具的安装方法、配置要点、常见问题以及注意事项，请仔细阅读。"
+    )
+    ascii_letters = sum(1 for ch in response if ch.isascii() and ch.isalpha())
+    assert ascii_letters / len(response) < 0.5, "fixture must be CJK-dominant"
+    assert not any("\u0400" <= ch <= "\u04ff" for ch in response)
+
+    should_translate, detected = detector.needs_translation(
+        response, "ru", method="unicode", detect_mixing=False)
+    assert should_translate is True
+    assert detected == "zh"
+
+    # Same shape for an Arabic target with an ASCII-heavy foreign reply.
+    should_translate_ar, _ = detector.needs_translation(
+        response, "ar", method="unicode", detect_mixing=False)
+    assert should_translate_ar is True
+
+
+def test_non_latin_target_still_honors_detect_mixing_for_mixed_text() -> None:
+    # The original mixed-text behaviour must survive: a Russian reply carrying
+    # enough Latin technical terms is mixing, so detect_mixing=False skips it
+    # while detect_mixing=True translates it.
+    response = "Это ответ на русском языке про Tailscale, Proxmox и OpenAI."
+    should_off, _ = detector.needs_translation(
+        response, "ru", method="unicode", detect_mixing=False)
+    assert should_off is False
+
+    should_on, _ = detector.needs_translation(
+        response, "ru", method="unicode", detect_mixing=True)
+    assert should_on is True
