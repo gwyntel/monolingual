@@ -1,38 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-
-ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_NAME = "monolingual_testpkg"
-
-
-def load_plugin_package() -> ModuleType:
-    """Load the plugin root as a package so relative imports work in tests."""
-    if PACKAGE_NAME in sys.modules:
-        return sys.modules[PACKAGE_NAME]
-    spec = importlib.util.spec_from_file_location(
-        PACKAGE_NAME,
-        ROOT / "__init__.py",
-        submodule_search_locations=[str(ROOT)],
-    )
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[PACKAGE_NAME] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-plugin = load_plugin_package()
-config_mod = sys.modules[f"{PACKAGE_NAME}.config"]
-detector = sys.modules[f"{PACKAGE_NAME}.detector"]
-translator = sys.modules[f"{PACKAGE_NAME}.translator"]
+from conftest import config_mod, detector, plugin, translator
 
 
 @pytest.fixture(autouse=True)
@@ -229,22 +202,126 @@ def test_needs_translation_respects_detect_mixing_flag() -> None:
     assert should_off is False
 
 
-def test_lingua_mixing_detection_uses_char_spans() -> None:
+class _FakeLinguaLanguage:
+    """Minimal stand-in for a lingua ``Language`` enum member."""
+
+    def __init__(self, iso_code: str) -> None:
+        self.iso_code_639_1 = SimpleNamespace(name=iso_code.upper())
+
+
+class _FakeDetectionResult:
+    """Stand-in for lingua 2.x ``DetectionResult``.
+
+    The real class exposes ``start_index`` / ``end_index`` / ``word_count`` /
+    ``language`` — character offsets into the analysed text — and has no
+    ``.words`` attribute at all (accessing it raises AttributeError). The
+    pre-fix detector read ``span.words``, the AttributeError was swallowed by
+    the blanket ``except``, and the lingua mixing layer silently returned
+    ``(False, 0.0)`` forever. Mirroring the missing attribute here means a
+    regression to ``span.words`` makes the assertions below fail instead of
+    quietly passing.
+    """
+
+    def __init__(self, start_index: int, end_index: int, iso_code: str) -> None:
+        self.start_index = start_index
+        self.end_index = end_index
+        self.word_count = 1
+        self.language = _FakeLinguaLanguage(iso_code)
+
+    @property
+    def words(self) -> Any:  # pragma: no cover - attribute intentionally absent
+        raise AttributeError("'DetectionResult' object has no attribute 'words'")
+
+
+def _install_fake_lingua(monkeypatch: pytest.MonkeyPatch, spans: list[_FakeDetectionResult]) -> None:
+    """Point the detector's lingua accessor at a deterministic span list."""
+    stub = SimpleNamespace(detect_multiple_languages_of=lambda text: list(spans))
+    monkeypatch.setattr(detector, "_get_lingua_detector", lambda: stub)
+
+
+def test_lingua_mixing_detection_uses_char_spans(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Deterministic replacement for the real-package test: no native lingua
+    # dependency, so this runs in every environment (CI included).
+    english = "The quarterly report shows strong growth across all major product lines. "
+    chinese = "本季度报告显示所有主要产品线均实现了强劲增长。"
+    en_block, zh_block = english * 6, chinese * 2
+    text = en_block + zh_block
+    spans = [
+        _FakeDetectionResult(0, len(en_block), "en"),
+        _FakeDetectionResult(len(en_block), len(text), "zh"),
+    ]
+    _install_fake_lingua(monkeypatch, spans)
+
+    # The mock must reproduce lingua's contract, not the buggy assumption.
+    with pytest.raises(AttributeError):
+        spans[1].words  # type: ignore[attr-defined]
+
+    is_mixing, ratio = detector._detect_lingua_mixing(text, "en")
+    assert is_mixing is True
+    # Span characters are counted, not word counts: ratio is exactly the
+    # minority span's share of the characters covered by all spans.
+    assert ratio == pytest.approx(len(zh_block) / len(text), rel=0, abs=1e-12)
+
+    # Exact 70/30 split: 30 of 100 covered characters are non-target.
+    mixed = "x" * 70 + "中" * 30
+    _install_fake_lingua(
+        monkeypatch,
+        [_FakeDetectionResult(0, 70, "en"), _FakeDetectionResult(70, 100, "zh")],
+    )
+    is_mixing, ratio = detector._detect_lingua_mixing(mixed, "en")
+    assert is_mixing is True
+    assert ratio == pytest.approx(0.30, rel=0, abs=1e-12)
+
+    # A 2% minority span is below the 0.05 mixing floor.
+    mostly_english = "x" * 98 + "中" * 2
+    _install_fake_lingua(
+        monkeypatch,
+        [_FakeDetectionResult(0, 98, "en"), _FakeDetectionResult(98, 100, "zh")],
+    )
+    is_mixing, ratio = detector._detect_lingua_mixing(mostly_english, "en")
+    assert is_mixing is False
+    assert ratio == pytest.approx(0.02, rel=0, abs=1e-12)
+
+    # No spans / no detector → no mixing, zero ratio (fail-open).
+    _install_fake_lingua(monkeypatch, [])
+    assert detector._detect_lingua_mixing(text, "en") == (False, 0.0)
+    monkeypatch.setattr(detector, "_get_lingua_detector", lambda: None)
+    assert detector._detect_lingua_mixing(text, "en") == (False, 0.0)
+
+
+def test_lingua_mixing_detection_real_package_integration() -> None:
+    # Integration coverage against the real native package. Skips when lingua
+    # is absent; the deterministic test above is the always-on regression gate.
     pytest.importorskip("lingua")
     ling = detector._get_lingua_detector()
-    assert ling is not None
-    en = "The quarterly report shows strong growth across all major product lines. " * 14
-    zh = "本季度报告显示所有主要产品线均实现了强劲增长。" * 14
-    text = en + zh
+    if ling is None:  # pragma: no cover - lingua import races
+        pytest.skip("lingua detector unavailable")
+    assert ling is not None  # narrows the Optional for type checkers
+
+    english = "The quarterly report shows strong growth across all major product lines. " * 8
+    chinese = "本季度报告显示所有主要产品线均实现了强劲增长。" * 8
+    text = english + chinese
     spans = ling.detect_multiple_languages_of(text)
-    langs = {detector._lang_from_lingua(s.language) for s in spans}
+    assert spans, "lingua returned no language spans"
+    for span in spans:
+        assert isinstance(span.start_index, int)
+        assert isinstance(span.end_index, int)
+        # lingua 2.x contract: char offsets, no word list.
+        assert not hasattr(span, "words")
+
+    langs = {detector._lang_from_lingua(span.language) for span in spans}
     if len(langs) < 2:
         pytest.skip("lingua did not return multiple language spans for mixed text")
+
+    covered = sum(span.end_index - span.start_index for span in spans)
+    non_target = sum(
+        span.end_index - span.start_index
+        for span in spans
+        if detector._lang_from_lingua(span.language) != "en"
+    )
     is_mixing, ratio = detector._detect_lingua_mixing(text, "en")
-    # Regression: the old code read span.words (AttributeError) and always
-    # returned (False, 0.0), so the lingua mixing branch could never fire.
     assert is_mixing is True
-    assert ratio > 0.05
+    assert ratio == pytest.approx(non_target / covered, rel=0, abs=1e-12)
 
 
 def test_detect_mixing_false_skips_mixed_text_with_two_cjk_chars() -> None:
@@ -309,3 +386,43 @@ def test_non_latin_target_still_honors_detect_mixing_for_mixed_text() -> None:
     should_on, _ = detector.needs_translation(
         response, "ru", method="unicode", detect_mixing=True)
     assert should_on is True
+
+
+def test_plugin_hooks_honor_detect_mixing_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Config → register() → needs_translation wiring for detect_mixing.
+
+    Covers the plumbing end to end: a ``detect_mixing: false`` config entry
+    must reach ``needs_translation`` through the hook, so an English reply
+    carrying two CJK characters is passed through untouched, while the default
+    (``true``) still translates it.
+    """
+    mixed = "This is an English response containing 中文 characters."
+
+    def use_config(mixing: bool) -> None:
+        def from_hermes_config(cls: type[Any]) -> Any:
+            return cls({"detector": "unicode", "detect_mixing": mixing})
+
+        monkeypatch.setattr(
+            config_mod.MonolingualConfig,
+            "from_hermes_config",
+            classmethod(from_hermes_config),
+        )
+        config_mod.reload_config()
+
+    use_config(False)
+    ctx = DummyCtx(SimpleNamespace(text="Translated"))
+    plugin.register(ctx)
+    ctx.hooks["pre_llm_call"](
+        session_id="mix",
+        user_message="This is a long enough English message.",
+        conversation_history=[],
+    )
+    assert plugin._get_profile("mix") == "en"
+
+    assert ctx.hooks["transform_llm_output"](session_id="mix", response_text=mixed) is None
+    assert ctx.llm_calls == []
+
+    use_config(True)
+    output = ctx.hooks["transform_llm_output"](session_id="mix", response_text=mixed)
+    assert output == "[translated from Chinese by GwynTel/monolingual]\n\nTranslated"
+    assert len(ctx.llm_calls) == 1

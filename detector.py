@@ -5,8 +5,10 @@ then determines whether the LLM response needs translation.
 
 Two detection strategies:
 1. **lingua** (default) — Rust-backed, accurate, supports mixed-language detection.
-2. **unicode** (fallback) — Zero-dependency heuristic for CJK vs Latin mixing.
-   No pip install needed. Good enough for the zh↔en mixing case.
+2. **unicode** (fallback) — Zero-dependency script heuristic. No pip install
+   needed. It reports *scripts*, not languages: every Cyrillic language comes
+   back as ``ru`` and every Latin one as ``en``, so see
+   :data:`UNICODE_DETECTABLE_LANGUAGES` for what it can actually name.
 """
 
 from __future__ import annotations
@@ -44,13 +46,59 @@ LANGUAGE_NAMES: Dict[str, str] = {
     "id": "Indonesian",
     "cs": "Czech",
     "sv": "Swedish",
+    "uk": "Ukrainian",
+    "bg": "Bulgarian",
+    "sr": "Serbian",
+    "he": "Hebrew",
+    "el": "Greek",
+    "bn": "Bengali",
+    "pa": "Punjabi",
+    "gu": "Gujarati",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "ka": "Georgian",
+    "hy": "Armenian",
 }
 
-LATIN_TARGET_LANGUAGES = {"en", "es", "fr", "de", "pt", "it", "nl", "pl", "tr", "sv", "cs", "id", "vi"}
+# Every language lingua 2.x classifies as Latin-script (``Language.all_with_latin_script``).
+# Targets sharing the Latin script are handled by the same-script rules — the
+# plugin cannot tell, say, Finnish from English by script, and the unicode
+# fallback reports all of them as "en". Kept complete so that a Latin-script
+# ``target_language`` from config is never mistaken for a script-unknown
+# language; ``test_latin_target_set_matches_lingua`` pins it to lingua's own
+# classification (the non-Latin remainder of lingua's 75 languages is
+# deliberately out of scope here).
+LATIN_TARGET_LANGUAGES = frozenset({
+    "af", "az", "bs", "ca", "cs", "cy", "da", "de", "en", "eo", "es", "et",
+    "eu", "fi", "fr", "ga", "hr", "hu", "id", "is", "it", "la", "lg", "lt",
+    "lv", "mi", "ms", "nb", "nl", "nn", "pl", "pt", "ro", "sk", "sl", "sn",
+    "so", "sq", "st", "sv", "sw", "tl", "tn", "tr", "ts", "vi", "xh", "yo",
+    "zu",
+})
 
 # Lingua confidence below this point is often ambiguous on short technical text.
 # We use unicode script heuristics as a tiebreaker instead of blindly trusting it.
 LINGUA_CONFIDENCE_THRESHOLD = 0.65
+
+# Minimum response length before a *same-script* mismatch is trusted as a
+# wrong-language reply. Below this, detector noise (lingua calling "Hello
+# world" Vietnamese) outweighs the signal. Only applies when the detector that
+# actually ran can emit the target language — see _effective_method and
+# _detectable_languages.
+SAME_SCRIPT_MIN_CHARS = 200
+
+# Share of a response that must be written in the target's own script before the
+# text counts as language *mixing* rather than a fully wrong-language reply.
+# Half is deliberately loose: a target-language reply that carries foreign
+# product names or a quoted phrase must still be classified as mixed (and
+# therefore be skipped when ``detect_mixing`` is off), while a reply in another
+# script has no target-script characters at all.
+TARGET_SCRIPT_DOMINANCE_RATIO = 0.5
+
+# Greek letters double as mathematical symbols (α, β, θ, λ), so counting Greek
+# *characters* alone would classify English technical prose as Greek text. Greek
+# only counts as text when Greek letters are a meaningful share of all letters.
+GREEK_TEXT_MIN_LETTER_RATIO = 0.25
 
 
 def language_name(code: str) -> str:
@@ -117,34 +165,67 @@ def _is_cjk_unified(cp: int) -> bool:
         0x20000 <= cp <= 0x2A6DF or   # Extension B
         0x2A700 <= cp <= 0x2B73F or   # Extension C
         0x2B740 <= cp <= 0x2B81F or   # Extension D
-        0x2B820 <= cp <= 0x2CEAF or   # Extension E/F
-        0x2CEB0 <= cp <= 0x2EBEF or   # Extension F/G/I area
-        0x30000 <= cp <= 0x3134F      # Extension G/H
+        0x2B820 <= cp <= 0x2CEAF or   # Extension E
+        0x2CEB0 <= cp <= 0x2EBEF or   # Extension F and adjacent blocks
+        0x30000 <= cp <= 0x3134F      # Extension G
     )
 
 
+# Which script counts, and with what weight, for each language the unicode
+# heuristic can name. Single source of truth for the scores built in
+# :func:`_detect_unicode` and for :data:`UNICODE_DETECTABLE_LANGUAGES`.
+_UNICODE_SCORE_WEIGHTS: Dict[str, Tuple[Tuple[str, float], ...]] = {
+    "zh": (("han", 1.0),),
+    "ja": (("kana", 1.0), ("han", 0.5)),   # kanji-only Japanese reads as Chinese
+    "ko": (("hangul", 1.0),),
+    "ru": (("cyrillic", 1.0),),
+    "ar": (("arabic", 1.0),),
+    "hi": (("devanagari", 1.0),),
+    "th": (("thai", 1.0),),
+    "he": (("hebrew", 1.0),),
+    "el": (("greek", 1.0),),
+    "bn": (("bengali", 1.0),),
+    "pa": (("gurmukhi", 1.0),),
+    "gu": (("gujarati", 1.0),),
+    "ta": (("tamil", 1.0),),
+    "te": (("telugu", 1.0),),
+    "ka": (("georgian", 1.0),),
+    "hy": (("armenian", 1.0),),
+}
+
+# Language codes the unicode heuristic can return. Text in any other script —
+# or in Latin script — is reported as "en", so a target outside this set can
+# never equal this detector's verdict; a mismatch for such a target is a
+# coverage artifact, not evidence of a wrong-language reply.
+UNICODE_DETECTABLE_LANGUAGES = frozenset(_UNICODE_SCORE_WEIGHTS) | {"en"}
+
+
 def _detect_unicode(text: str) -> Optional[str]:
-    """Crude unicode-range heuristic. Returns ISO 639-1 or None."""
+    """Crude unicode-range heuristic. Returns ISO 639-1 or None.
+
+    Covers every script in :data:`_SCRIPT_RANGES`. The result names the
+    *script*: languages sharing one are not told apart (Ukrainian, Bulgarian
+    and Serbian all come back as ``ru``; any Latin-script language comes back
+    as ``en``). Lingua is the detector that distinguishes them — see
+    :data:`UNICODE_DETECTABLE_LANGUAGES` for the full set of codes this can
+    return.
+    """
     if not text:
         return None
-    # Script counters
-    zh_count = sum(1 for ch in text if _is_cjk_unified(ord(ch)))
-    ja_hira = sum(1 for ch in text if 0x3040 <= ord(ch) <= 0x309F)
-    ja_kata = sum(1 for ch in text if 0x30A0 <= ord(ch) <= 0x30FF)
-    ko_count = sum(1 for ch in text if 0xAC00 <= ord(ch) <= 0xD7AF)
-    ar_count = sum(1 for ch in text if 0x0600 <= ord(ch) <= 0x06FF)
-    cyrillic = sum(1 for ch in text if 0x0400 <= ord(ch) <= 0x04FF)
-    deva = sum(1 for ch in text if 0x0900 <= ord(ch) <= 0x097F)
-    thai = sum(1 for ch in text if 0x0E00 <= ord(ch) <= 0x0E7F)
+    counts = {
+        script: len(pattern.findall(text))
+        for script, pattern in _SCRIPT_RANGES.items()
+    }
+    # Greek letters inside Latin prose are usually notation, not Greek text.
+    letters = sum(1 for ch in text if ch.isalpha())
+    greek_score = counts["greek"]
+    if letters and greek_score / letters < GREEK_TEXT_MIN_LETTER_RATIO:
+        greek_score = 0
 
+    counts["greek"] = greek_score
     scores = {
-        "zh": zh_count,
-        "ja": ja_hira + ja_kata + zh_count * 0.5,
-        "ko": ko_count,
-        "ar": ar_count,
-        "ru": cyrillic,
-        "hi": deva,
-        "th": thai,
+        code: sum(counts[script] * weight for script, weight in weights)
+        for code, weights in _UNICODE_SCORE_WEIGHTS.items()
     }
     best = max(scores, key=scores.get)  # type: ignore[arg-type]
     if scores[best] < 2:
@@ -156,7 +237,79 @@ def _detect_unicode(text: str) -> Optional[str]:
 # Lingua detector (primary) — lazy-loaded, scoped languages
 # ---------------------------------------------------------------------------
 
+# Language codes handed to lingua as candidates, mapped to their lingua
+# ``Language`` member names. Lingua can only ever return one of these codes, so
+# the table doubles as :data:`LINGUA_DETECTABLE_LANGUAGES`.
+#
+# The list is deliberately narrow — lingua is more accurate on short text with
+# fewer candidates — but it must contain every language whose script the plugin
+# claims to distinguish. Cyrillic languages (uk/bg/sr) and Hebrew/Greek are in
+# here because the unicode fallback collapses all Cyrillic to ``ru`` and cannot
+# name Hebrew or Greek text reliably.
+_LINGUA_CANDIDATES: Dict[str, str] = {
+    "en": "ENGLISH",
+    "zh": "CHINESE",
+    "ja": "JAPANESE",
+    "ko": "KOREAN",
+    "es": "SPANISH",
+    "fr": "FRENCH",
+    "de": "GERMAN",
+    "ru": "RUSSIAN",
+    "ar": "ARABIC",
+    "hi": "HINDI",
+    "it": "ITALIAN",
+    "nl": "DUTCH",
+    "pl": "POLISH",
+    "tr": "TURKISH",
+    "vi": "VIETNAMESE",
+    "th": "THAI",
+    "pt": "PORTUGUESE",
+    "cs": "CZECH",
+    "sv": "SWEDISH",
+    "id": "INDONESIAN",
+    "uk": "UKRAINIAN",
+    "bg": "BULGARIAN",
+    "sr": "SERBIAN",
+    "he": "HEBREW",
+    "el": "GREEK",
+}
+
+LINGUA_DETECTABLE_LANGUAGES = (
+    frozenset(_LINGUA_CANDIDATES) | UNICODE_DETECTABLE_LANGUAGES
+)
+# The lingua path also consults the unicode heuristic when confidence is low
+# (see _detect_lingua), so it can return any code listed there as well.
+
 _lingua_detector = None
+
+
+def _detectable_languages(method: str) -> frozenset[str]:
+    """Return the language codes the given detection method can report.
+
+    A target outside this set can never equal the method's verdict, so a
+    "different language" result for it carries no information: it is a coverage
+    gap (unicode reports one code per script; lingua only knows its candidates),
+    not evidence the reply is in the wrong language.
+    """
+    if (method or "lingua").lower() == "unicode":
+        return UNICODE_DETECTABLE_LANGUAGES
+    return LINGUA_DETECTABLE_LANGUAGES
+
+
+def _effective_method(method: str) -> str:
+    """Return the detection method that actually runs for ``method``.
+
+    :func:`detect_language` falls back to the unicode heuristic whenever lingua
+    is unavailable, so asking for ``"lingua"`` does not guarantee lingua's
+    vocabulary: the verdict can be a script code instead. Callers weighing a
+    same-script mismatch must consult *this* method, not the requested one —
+    otherwise a target lingua knows but unicode cannot name (``uk``, ``bg``,
+    ``sr``, ...) is "detected" as ``ru`` and a long reply in the user's own
+    language is rewritten.
+    """
+    if (method or "lingua").lower() == "unicode":
+        return "unicode"
+    return "lingua" if _get_lingua_detector() is not None else "unicode"
 
 
 def _get_lingua_detector():
@@ -172,30 +325,12 @@ def _get_lingua_detector():
         return _lingua_detector
     try:
         from lingua import Language, LanguageDetectorBuilder
+        candidates = [
+            getattr(Language, attribute) for attribute in _LINGUA_CANDIDATES.values()
+        ]
         _lingua_detector = (
             LanguageDetectorBuilder
-            .from_languages(
-                Language.ENGLISH,
-                Language.CHINESE,
-                Language.JAPANESE,
-                Language.KOREAN,
-                Language.SPANISH,
-                Language.FRENCH,
-                Language.GERMAN,
-                Language.RUSSIAN,
-                Language.ARABIC,
-                Language.HINDI,
-                Language.ITALIAN,
-                Language.DUTCH,
-                Language.POLISH,
-                Language.TURKISH,
-                Language.VIETNAMESE,
-                Language.THAI,
-                Language.PORTUGUESE,
-                Language.CZECH,
-                Language.SWEDISH,
-                Language.INDONESIAN,
-            )
+            .from_languages(*candidates)
             .with_preloaded_language_models()
             .build()
         )
@@ -352,7 +487,7 @@ def detect_user_language(
     if not user_texts:
         return None
 
-    # Detect language per message with confidence weighting
+    # Detect language per message with length weighting
     lang_scores: Dict[str, float] = defaultdict(float)
     for text in user_texts:
         lang = detect_language(text, method=method)
@@ -368,38 +503,26 @@ def detect_user_language(
 
 
 def _is_mixed_text(text: str, target_language: str) -> bool:
-    """Return True if the target script still dominates the text.
+    """Return True if the target script is present and dominant in the text.
 
-    Distinguishes genuinely wrong-language responses from mixed text: a few
-    foreign-script characters can flip whole-text detection (e.g. the unicode
-    heuristic reports "zh" for English text containing just two CJK chars),
-    but the response is still mostly the user's language. Mixed text should
-    honor ``detect_mixing`` instead of translating unconditionally.
-
-    For a non-Latin target the test is "is the target script present and
-    dominant", never "are ASCII letters a minority". Counting only Latin
-    characters made a Chinese or Arabic reply that happens to contain product
-    names ("OpenAI", "ChatGPT", "Proxmox") look like mixing in a Russian
-    conversation: the target script was absent entirely, yet the ASCII share
-    was below half, so ``detect_mixing=False`` skipped the translation the user
-    needed. Absent target script is a wrong-language response, not mixing.
+    Distinguishes genuine language mixing from a wrong-language reply: a
+    target-language response carrying foreign product names stays "mixed" and
+    honours ``detect_mixing``, while a reply with none of the target script is
+    the wrong language and must be translated. A target whose script this
+    plugin cannot name is never reported as mixed — without a target script
+    there is no evidence the reply is in the user's language, and guessing
+    "mixed" is what silently skipped translations.
     """
     if not text:
         return False
     if target_language in LATIN_TARGET_LANGUAGES:
-        foreign_chars = len(_NON_LATIN_RANGES.findall(text))
-        return (foreign_chars / len(text)) < 0.5
+        foreign_share = _count_foreign_chars(text) / len(text)
+        return foreign_share < TARGET_SCRIPT_DOMINANCE_RATIO
     target_range = _TARGET_SCRIPT_RANGES.get(target_language)
-    if target_range is not None:
-        target_chars = len(target_range.findall(text))
-        if target_chars == 0:
-            # No target-script character at all: not mixing, just wrong language.
-            return False
-        return (target_chars / len(text)) >= 0.5
-    # Unknown non-Latin target: no script range to compare against, so fall back
-    # to the ASCII-minority heuristic.
-    foreign_chars = len(re.findall(r"[A-Za-z]", text))
-    return (foreign_chars / len(text)) < 0.5
+    if target_range is None:
+        return False
+    target_share = len(target_range.findall(text)) / len(text)
+    return target_share >= TARGET_SCRIPT_DOMINANCE_RATIO
 
 
 def needs_translation(
@@ -420,6 +543,13 @@ def needs_translation(
 
     Returns:
         (needs_translation, detected_source_language)
+
+    A mismatch is only trusted when it carries information. ``detected`` can
+    never equal a target the detector that actually ran cannot emit, so for such
+    targets (unicode with any code but the ones it names, lingua with a language
+    outside its candidate list) a same-script mismatch is left alone instead of
+    rewriting the user's own language; see :func:`_effective_method` and
+    :func:`_detectable_languages`.
     """
     if not response_text or not response_text.strip():
         return False, None
@@ -430,31 +560,60 @@ def needs_translation(
         return False, None  # only code, nothing to translate
 
     detected = detect_language(text_no_code, method=method)
+    # Same-script evidence is only meaningful when the detector that actually
+    # ran could have reported the target language at all. Otherwise every reply
+    # in the user's language is a guaranteed "mismatch" (unicode reports every
+    # Cyrillic language as ru and every Latin one as en), and a long one would
+    # be rewritten on no evidence. `method` alone is not enough: a request for
+    # lingua that falls back to unicode must be judged by unicode's vocabulary.
+    same_script_reliable = target_language in _detectable_languages(
+        _effective_method(method))
 
     # Case 1: response is entirely in a different language
-    # But only trigger if there are actually foreign-script characters present.
-    # Lingua misclassifies very short Latin text (e.g. "Hello world" → vi),
-    # so we guard with a script check.
     if detected and detected != target_language:
+        # For Latin targets this counts foreign-script characters; for non-Latin
+        # targets it counts Latin words (see _count_non_target_script_chars).
         foreign_count = _count_non_target_script_chars(text_no_code, target_language)
-        if foreign_count == 0:
-            # Same script as target, different language detected —
-            # likely short-text misclassification. Only trust if long.
-            if len(text_no_code) > 200:
+        is_latin_target = target_language in LATIN_TARGET_LANGUAGES
+
+        if is_latin_target:
+            if foreign_count == 0:
+                # Same script as the target: lingua misclassifies very short
+                # Latin text (e.g. "Hello world" → vi), so only trust the
+                # mismatch on a long response the method could have named.
+                if same_script_reliable and len(text_no_code) > SAME_SCRIPT_MIN_CHARS:
+                    return True, detected
+                # Short and same script: not enough evidence to rewrite.
+            elif _is_mixed_text(text_no_code, target_language):
+                # The target script still dominates: this is language *mixing*,
+                # not a fully wrong-language response — honor detect_mixing.
+                return detect_mixing, detected
+            else:
+                # Foreign-script characters dominate: translate.
                 return True, detected
-            # Short text, same script — skip. Fall through to mixing check.
-        elif _is_mixed_text(text_no_code, target_language):
-            # The target script still dominates: this is language *mixing*,
-            # not a fully wrong-language response — honor detect_mixing.
-            if detect_mixing:
-                return True, detected
-            return False, detected
         else:
-            # Fully (or mostly) wrong-language response. For Latin targets
-            # (en, es, etc.), foreign-script chars are present. For non-Latin
-            # targets (zh, ja, etc.), require 3+ Latin words to avoid
-            # false-positives on tech terms.
-            if target_language in LATIN_TARGET_LANGUAGES or foreign_count >= 3:
+            foreign_script_count = _count_foreign_script_chars(
+                text_no_code, target_language)
+            mixed = _is_mixed_text(text_no_code, target_language)
+            if foreign_script_count > 0 and not mixed:
+                # No character of the target script, but another script is
+                # present: the whole reply is in a foreign language. Translate
+                # it even with detect_mixing disabled.
+                return True, detected
+            if foreign_count == 0:
+                # Same script family (or no Latin at all): the "foreign"
+                # verdict may just be same-script confusion — the unicode
+                # heuristic reports every Cyrillic language as ru — so only
+                # trust a long response the method could have named.
+                if same_script_reliable and len(text_no_code) > SAME_SCRIPT_MIN_CHARS:
+                    return True, detected
+            elif mixed:
+                # Target script present and dominant: language mixing, not a
+                # fully wrong-language reply. Honor detect_mixing.
+                return detect_mixing, detected
+            elif foreign_count >= 3:
+                # Latin-script reply carrying 3+ Latin words: a real foreign
+                # reply, not a product name.
                 return True, detected
 
     # Case 2: response looks like target language, but check for mixing
@@ -481,74 +640,168 @@ def needs_translation(
     return False, detected
 
 
-# Non-target script character ranges. Used to catch single CJK chars that
-# lingua's word-level mixing detector misses.
-_NON_LATIN_RANGES = re.compile(
-    "[" +
-    r"\u4e00-\u9fff"     # CJK Unified Ideographs
-    r"\u3400-\u4dbf"     # CJK Extension A
-    r"\U00020000-\U0002a6df"  # CJK Extension B (needs \U, not \u)
-    r"\U0002a700-\U0002b73f"  # CJK Extension C
-    r"\U0002b740-\U0002b81f"  # CJK Extension D
-    r"\U0002b820-\U0002ceaf"  # CJK Extension E/F
-    r"\U0002ceb0-\U0002ebef"  # CJK Extension F/G/I area
-    r"\U00030000-\U0003134f"  # CJK Extension G/H
-    r"\u3040-\u309f"     # Hiragana
-    r"\u30a0-\u30ff"     # Katakana
-    r"\uac00-\ud7af"     # Hangul Syllables
-    r"\u0600-\u06ff"     # Arabic
-    r"\u0400-\u04ff"     # Cyrillic
-    r"\u0900-\u097f"     # Devanagari
-    r"\u0e00-\u0e7f"     # Thai
-    "]"
-)
+# ---------------------------------------------------------------------------
+# Script coverage
+# ---------------------------------------------------------------------------
 
-# Script range for the target itself, used to decide whether a non-Latin reply is
-# "mixed" (target script present and dominant) or simply the wrong language.
-# Languages without an entry fall back to the ASCII-minority heuristic.
-_TARGET_SCRIPT_RANGES = {
-    "zh": re.compile(
-        "["
+# Character-class bodies for every script this plugin recognises. Ranges are
+# kept as fragments so the per-language target ranges and the "any non-Latin
+# script" range are all built from one source of truth.
+_SCRIPT_CLASS_BODIES: Dict[str, str] = {
+    "han": (
         r"\u4e00-\u9fff"          # CJK Unified Ideographs
         r"\u3400-\u4dbf"          # CJK Extension A
         r"\U00020000-\U0002a6df"  # CJK Extension B
         r"\U0002a700-\U0002b73f"  # CJK Extension C
         r"\U0002b740-\U0002b81f"  # CJK Extension D
-        r"\U0002b820-\U0002ceaf"  # CJK Extension E/F
-        r"\U0002ceb0-\U0002ebef"  # CJK Extension F/G/I area
-        r"\U00030000-\U0003134f"  # CJK Extension G/H
-        "]"
+        r"\U0002b820-\U0002ceaf"  # CJK Extension E
+        r"\U0002ceb0-\U0002ebef"  # CJK Extension F and adjacent blocks
+        r"\U00030000-\U0003134f"  # CJK Extension G
     ),
-    "ja": re.compile(
-        "["
-        r"\u4e00-\u9fff"          # Kanji
+    "kana": (
         r"\u3040-\u309f"          # Hiragana
         r"\u30a0-\u30ff"          # Katakana
         r"\uff66-\uff9d"          # Halfwidth Katakana
-        "]"
     ),
-    "ko": re.compile(
-        "["
+    "hangul": (
         r"\uac00-\ud7af"          # Hangul Syllables
         r"\u1100-\u11ff"          # Hangul Jamo
         r"\u3130-\u318f"          # Hangul Compatibility Jamo
-        "]"
     ),
-    "ru": re.compile(r"[\u0400-\u04ff]"),   # Cyrillic
-    "ar": re.compile(r"[\u0600-\u06ff\u0750-\u077f]"),  # Arabic
-    "hi": re.compile(r"[\u0900-\u097f]"),   # Devanagari
-    "th": re.compile(r"[\u0e00-\u0e7f]"),   # Thai
+    "cyrillic": r"\u0400-\u04ff",
+    "hebrew": r"\u0590-\u05ff",
+    "greek": r"\u0370-\u03ff\u1f00-\u1fff",
+    "arabic": r"\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff",
+    "devanagari": r"\u0900-\u097f",
+    "bengali": r"\u0980-\u09ff",
+    "gurmukhi": r"\u0a00-\u0a7f",
+    "gujarati": r"\u0a80-\u0aff",
+    "tamil": r"\u0b80-\u0bff",
+    "telugu": r"\u0c00-\u0c7f",
+    "thai": r"\u0e00-\u0e7f",
+    "georgian": r"\u10a0-\u10ff\u1c90-\u1cbf",
+    "armenian": r"\u0530-\u058f",
 }
+
+
+def _script_range(*scripts: str) -> re.Pattern[str]:
+    """Compile one character class covering the given script(s)."""
+    return re.compile("[" + "".join(_SCRIPT_CLASS_BODIES[s] for s in scripts) + "]")
+
+
+_SCRIPT_RANGES: Dict[str, re.Pattern[str]] = {
+    script: _script_range(script) for script in _SCRIPT_CLASS_BODIES
+}
+
+# Every non-Latin script the plugin recognises, used to catch single foreign
+# characters that lingua's word-level mixing detector misses. Greek is excluded
+# from this blanket range because bare Greek letters (θ, α, λ) are ordinary
+# notation in technical prose; Greek is counted separately, and only when it
+# dominates the text's letters (see _count_foreign_chars), so a Greek reply is
+# still detected while an equation is not rewritten.
+_NON_LATIN_RANGES = _script_range(
+    *(script for script in _SCRIPT_CLASS_BODIES if script != "greek")
+)
+
+# Script(s) each non-Latin target language is written in. Cyrillic languages
+# share one range: the unicode heuristic cannot tell them apart, but
+# _is_mixed_text only needs "is the target script present and dominant".
+# Languages outside this table are treated as script-unknown; see
+# _is_mixed_text and _count_foreign_script_chars.
+_TARGET_SCRIPTS: Dict[str, Tuple[str, ...]] = {
+    "zh": ("han",),
+    "ja": ("han", "kana"),
+    "ko": ("hangul",),
+    "ru": ("cyrillic",),
+    "uk": ("cyrillic",),
+    "bg": ("cyrillic",),
+    "sr": ("cyrillic",),
+    "mk": ("cyrillic",),
+    "be": ("cyrillic",),
+    "kk": ("cyrillic",),
+    "mn": ("cyrillic",),
+    "he": ("hebrew",),
+    "el": ("greek",),
+    "ar": ("arabic",),
+    "fa": ("arabic",),
+    "ur": ("arabic",),
+    "hi": ("devanagari",),
+    "mr": ("devanagari",),
+    "ne": ("devanagari",),
+    "bn": ("bengali",),
+    "pa": ("gurmukhi",),
+    "gu": ("gujarati",),
+    "ta": ("tamil",),
+    "te": ("telugu",),
+    "th": ("thai",),
+    "ka": ("georgian",),
+    "hy": ("armenian",),
+}
+
+# Script range for the target itself, used to decide whether a non-Latin reply is
+# "mixed" (target script present and dominant) or simply the wrong language.
+_TARGET_SCRIPT_RANGES: Dict[str, re.Pattern[str]] = {
+    code: _script_range(*scripts) for code, scripts in _TARGET_SCRIPTS.items()
+}
+
+
+def _count_foreign_script_chars(text: str, target_language: str) -> int:
+    """Count characters in a recognised script that is not the target's.
+
+    Tells "reply written in a completely different script" (a wrong-language
+    response that must be translated) apart from "reply in the target script"
+    (mixing, governed by ``detect_mixing``). Targets whose script is unknown
+    count every recognised script as foreign, which is the conservative
+    choice: a named foreign script is evidence the text is not the target
+    language, while silence would skip the translation.
+    """
+    if not text:
+        return 0
+    target_scripts = _TARGET_SCRIPTS.get(target_language, ())
+    return sum(
+        len(pattern.findall(text))
+        for script, pattern in _SCRIPT_RANGES.items()
+        if script not in target_scripts
+    )
+
+
+def _count_foreign_chars(text: str) -> int:
+    """Count non-Latin-script characters in text written for a Latin target.
+
+    Greek is special-cased: a Greek reply is foreign, but ``α``/``β`` inside
+    English prose is notation. Greek characters only count when they make up a
+    meaningful share of the text's letters.
+    """
+    foreign = len(_NON_LATIN_RANGES.findall(text))
+    greek = len(_SCRIPT_RANGES["greek"].findall(text))
+    if greek:
+        letters = sum(1 for ch in text if ch.isalpha())
+        if letters and greek / letters >= GREEK_TEXT_MIN_LETTER_RATIO:
+            foreign += greek
+    return foreign
+
+
+def _count_latin_words(text: str) -> int:
+    """Count Latin-alphabet words that look like prose, not product names.
+
+    URLs, filesystem paths, e-mail addresses and ALL-CAPS abbreviations are
+    stripped first so technical tokens do not masquerade as foreign words.
+    """
+    cleaned = re.sub(r"https?://\S+|www\.\S+|\b[\w.-]+@[\w.-]+", " ", text)
+    cleaned = re.sub(r"\b[A-Za-z]:[\\/][^\s]+|(?:[./~]|/)[^\s]+", " ", cleaned)
+    cleaned = re.sub(r"\b[A-Z_][A-Z0-9_]{2,}\b", " ", cleaned)
+    return len(re.findall(r"[A-Za-z]{3,}", cleaned))
+
 
 def _count_non_target_script_chars(text: str, target_language: str) -> int:
     """Count characters whose script doesn't belong to target_language.
 
-    For Latin-script targets (en, es, fr, de, etc.), counts CJK/Arabic/
-    Cyrillic/Devanagari/Thai characters — even single chars count.
+    For Latin-script targets (en, es, fr, de, etc.), counts characters in a
+    recognised non-Latin script — even single chars count.
 
-    For non-Latin targets (zh, ja, ko, ar, ru, hi, th), counts Latin
-    characters that appear outside of URLs, numbers, and common technical
-    terms. Returns the raw count so the caller can decide the threshold.
+    For non-Latin targets (zh, ja, ko, ar, ru, he, el, ...), counts Latin
+    words that appear outside of URLs, paths, and ALL-CAPS abbreviations.
+    Returns the raw count so the caller can decide the threshold.
 
     Returns 0 if no foreign-script characters found.
     """
@@ -557,15 +810,8 @@ def _count_non_target_script_chars(text: str, target_language: str) -> int:
 
     if target_language in LATIN_TARGET_LANGUAGES:
         # Count non-Latin script chars — even a single one is suspicious
-        return len(_NON_LATIN_RANGES.findall(text))
-    else:
-        # For non-Latin targets, count sequences of Latin letters that look
-        # like actual words (3+ consecutive letters, not just abbreviations).
-        cleaned = re.sub(r"https?://\S+|www\.\S+|\b[\w.-]+@[\w.-]+\b", " ", text)
-        cleaned = re.sub(r"\b[A-Za-z]:[\\/][^\s]+|(?:[./~]|/)[^\s]+", " ", cleaned)
-        cleaned = re.sub(r"\b[A-Z_][A-Z0-9_]{2,}\b", " ", cleaned)
-        latin_words = re.findall(r'[A-Za-z]{3,}', cleaned)
-        return len(latin_words)
+        return _count_foreign_chars(text)
+    return _count_latin_words(text)
 
 
 def _strip_code_blocks(text: str) -> str:

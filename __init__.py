@@ -183,7 +183,7 @@ def register(ctx: Any) -> None:
             _clear_profile(session_id)
         return None
 
-    # Register both hooks
+    # Register all three hooks (see provides_hooks in plugin.yaml).
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("transform_llm_output", on_transform_llm_output)
     ctx.register_hook("on_session_end", on_session_end)
