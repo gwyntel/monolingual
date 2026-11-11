@@ -26,7 +26,7 @@ Monolingual is a Hermes Agent plugin that:
 pip install lingua-language-detector
 
 # Clone the plugin into Hermes plugins directory
-git clone https://github.com/GwynTel/monolingual.git ~/.hermes/plugins/monolingual
+git clone https://github.com/gwyntel/monolingual.git ~/.hermes/plugins/monolingual
 
 # Enable the plugin
 hermes plugins enable monolingual
@@ -50,6 +50,8 @@ On every LLM response, the `transform_llm_output` hook checks:
 
 1. **Primary check:** Is the response entirely in a different language than yours?
 2. **Secondary check:** Does the response mix your language with another language? (Only if `detect_mixing` is on.)
+
+Same-script mismatches are only trusted on longer text, and only for languages the active detector can actually report: if the detected language differs from yours but uses the same script (e.g. a short French sentence for an English user), the response must be over 200 characters before it counts as wrong-language. Shorter text is treated as detector noise and falls through to the mixing check. When the active detector cannot name your language at all — the `unicode` fallback reports one code per script, lingua only knows its candidate list — the same-script check is skipped entirely: a mismatch there is a coverage gap, not evidence, and rewriting a long reply on it would translate your own language into itself.
 
 If either check triggers, the plugin calls the host's `ctx.llm.complete()` to translate the response, then replaces the original text with the translation.
 
@@ -88,7 +90,7 @@ plugins:
 
       # Override auto-detection: force a specific target language
       # If empty (default), the plugin learns from your messages
-      target_language: ""              # e.g. "en", "zh", "ja", "ko", "es"
+      target_language: ""              # e.g. "en", "zh", "ja", "ko", "es", "uk", "he"
 
       # How many recent user messages to sample for language detection
       sample_window: 10               # default: 10
@@ -96,8 +98,15 @@ plugins:
       # Skip messages shorter than this (unreliable for detection)
       min_sample_length: 20           # default: 20
 
-      # Fraction of non-target text to trigger mixing translation
+      # Fraction of non-target lingua spans needed to trigger mixing
+      # translation. Only applies to the lingua span check; the unicode
+      # fallback uses fixed script thresholds instead (1 foreign char for
+      # Latin targets, 3 Latin words for non-Latin targets).
       min_mix_ratio: 0.15             # default: 0.15
+
+      # Also translate responses that mix your language with another one.
+      # Disable if you only want full wrong-language responses rewritten.
+      detect_mixing: true             # default: true
 
       # Detection method: "lingua" (accurate) or "unicode" (fast, zero-dep)
       detector: "lingua"              # default: "lingua"
@@ -121,17 +130,32 @@ plugins:
 
 ### lingua (default)
 
-[lingua-language-detector](https://pypi.org/project/lingua-language-detector/) — Rust-backed, highly accurate, supports mixed-language detection across 75 languages. This is the recommended method. Monolingual narrows Lingua to the plugin's supported common languages for better short-text accuracy, preloads language models for repeated plugin use, and falls back to Unicode script heuristics when confidence is low.
+[lingua-language-detector](https://pypi.org/project/lingua-language-detector/) — Rust-backed, highly accurate, supports mixed-language detection across 75 languages. This is the recommended method.
+
+Monolingual narrows lingua to a candidate list for better short-text accuracy, preloads the language models for repeated plugin use, and falls back to Unicode script heuristics when confidence is low.
+
+Candidates: English, Chinese, Japanese, Korean, Spanish, French, German, Portuguese, Italian, Dutch, Polish, Czech, Swedish, Turkish, Vietnamese, Indonesian, Russian, Ukrainian, Bulgarian, Serbian, Hebrew, Greek, Arabic, Hindi, Thai.
+
+Ukrainian, Bulgarian, Serbian, Hebrew and Greek are included because the Unicode fallback cannot distinguish them — it reports every Cyrillic language as `ru` and cannot name Hebrew or Greek text reliably. A target outside this list (Finnish, Hungarian, …) is not distinguishable by either detector, so a same-script reply in that language is never treated as a wrong-language response; it passes through untouched.
 
 Install: `pip install lingua-language-detector`
 
 ### unicode (fallback)
 
-A zero-dependency heuristic that checks Unicode codepoint ranges for CJK, Arabic, Cyrillic, Devanagari, Thai, and Hangul. No pip install needed. Good enough for the common zh↔en mixing case. Falls back to this automatically if lingua isn't installed.
+A zero-dependency heuristic that reads Unicode codepoint ranges. It names *scripts*, not languages — good enough for the common zh↔en mixing case, no pip install needed.
+
+Scripts recognised: Han (including extension ranges through U+3134F), Hiragana/Katakana, Hangul, Cyrillic, Arabic, Devanagari, Bengali, Gurmukhi, Gujarati, Tamil, Telugu, Thai, Hebrew, Greek, Georgian, Armenian. Greek only counts as Greek text when Greek letters make up at least 25% of all letters, so `α`/`β`/`θ` in technical prose stay mathematics. Text in any other script — including every Latin-script language — is reported as English.
+
+Limits of the method:
+
+- One code per script. Ukrainian, Bulgarian, Serbian, Belarusian, Kazakh, Mongolian and Macedonian all report as `ru`; Finnish, Polish, Spanish and every other Latin-script language report as `en`.
+- Mixing *between* languages that share a script cannot be detected, and a reply in a same-script language the heuristic cannot name is left alone rather than translated — it may be the user's own language.
+- Use lingua if you need those distinctions; `detector: "lingua"` is the default for exactly this reason.
 
 ## Design Decisions
 
 - **Fail-open:** Any error in detection or translation → original text passes through. Never blocks output.
+- **Method-aware trust:** a same-script mismatch only counts as a wrong-language signal when the active detector can actually report the user's language; otherwise the reply passes through untouched. Coverage gaps must never become translations of the user's own words.
 - **Session-scoped profiles:** Language detection is per-session, rebuilt from conversation history each turn, and cleared on `on_session_end`. No persistent state needed.
 - **`transform_llm_output` hook:** The right Hermes hook for this job — returns a replacement string. `post_llm_call` is observer-only.
 - **`ctx.llm` for translation:** Uses the host's PluginLlm facade — supported, no internal API imports needed.

@@ -127,6 +127,7 @@ def register(ctx: Any) -> None:
                 target_language=target_lang,
                 method=config.detector,
                 min_mix_ratio=config.min_mix_ratio,
+                detect_mixing=config.detect_mixing,
             )
         except Exception as exc:
             logger.debug("monolingual: response language detection failed: %s", exc)
@@ -182,7 +183,7 @@ def register(ctx: Any) -> None:
             _clear_profile(session_id)
         return None
 
-    # Register both hooks
+    # Register all three hooks (see provides_hooks in plugin.yaml).
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("transform_llm_output", on_transform_llm_output)
     ctx.register_hook("on_session_end", on_session_end)
