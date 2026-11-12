@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  precheck:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate tag and plugin files
+        run: python scripts/release.py --tag "$GITHUB_REF_NAME" --output /tmp/dist
+
+  tests:
+    name: Run release test gate
+    needs: precheck
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+
+  release:
+    name: Build and publish release
+    needs: [precheck, tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$(git rev-parse "${GITHUB_SHA}^{commit}")" origin/main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate tag and build release archive
+        run: python scripts/release.py --tag "$GITHUB_REF_NAME" --output dist
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum ./*.zip > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "::error::Release $GITHUB_REF_NAME is already published"
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --generate-notes \
+              --title "Monolingual $GITHUB_REF_NAME" \
+              --draft \
+              "${flags[@]}"
+          fi
+
+          gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false "${flags[@]}"
+
+          if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" != "false" ]; then
+            echo "::error::Release $GITHUB_REF_NAME did not publish"
+            exit 1
+          fi
