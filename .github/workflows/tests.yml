@@ -1,0 +1,51 @@
+name: Tests
+
+on:
+  workflow_call:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} (${{ matrix.lingua && 'lingua' || 'unicode fallback' }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.11"
+            lingua: true
+          - python: "3.12"
+            lingua: true
+          - python: "3.13"
+            lingua: true
+          - python: "3.14"
+            lingua: true
+          - python: "3.13"
+            lingua: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/requirements-ci.txt
+
+      - name: Install lingua detector
+        if: matrix.lingua
+        run: python -m pip install -r tests/requirements-lingua.txt
+
+      - name: Run test suite
+        working-directory: tests
+        run: python -m pytest . -q
